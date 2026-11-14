@@ -1,0 +1,67 @@
+[workspace]
+resolver = "2"
+members = [
+    ".",
+    "fuzz",
+]
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.95"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/dtn-postmaster/dtnpm-cla-hqfbp-kiss"
+
+[package]
+name = "dtnpm-cla-hqfbp-kiss"
+description = "Hamradio Quick File Broadcasting Protocol (HQFBP) convergence layer adapter for Hardy BPv7"
+version = "0.2.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "README.md"
+keywords = ["dtn", "bpv7", "convergence-layer", "hqfbp", "hamradio", "kiss"]
+categories = ["network-programming"]
+
+[lib]
+name = "dtnpm_cla_hqfbp_kiss"
+path = "src/lib.rs"
+crate-type = ["rlib"]
+
+[[bin]]
+name = "dtnpm-cla-hqfbp-kiss"
+path = "src/main.rs"
+required-features = ["cli"]
+
+[features]
+default = ["cli", "serial"]
+serde = ["dep:serde", "hardy-bpa/serde", "hardy-bpv7/serde", "dep:humantime"]
+serial = ["dep:tokio-serial"]
+cli = ["serde", "dep:clap", "dep:serde_yaml", "dep:toml", "dep:tracing-subscriber", "dep:anyhow", "dtnpm-core/transport-grpc"]
+instrument = ["tracing/attributes"]
+
+[dependencies]
+hardy-async = { version = "0.2", path = "../../hardy/async" }
+hardy-bpa = { version = "0.2", path = "../../hardy/bpa" }
+hardy-bpv7 = { version = "0.6", path = "../../hardy/bpv7" }
+hqfbp-rs = { path = "../../hqfbp-rs" }
+dtnpm-core = { version = "0.2", path = "../dtnpm-core", default-features = false }
+tokio = { version = "1", features = ["macros", "net", "sync", "time", "rt", "io-util", "signal"] }
+tokio-serial = { version = "5", optional = true }
+tracing = { version = "0.1", default-features = false }
+thiserror = "2"
+bytes = "1"
+no-panic = "0.1"
+serde = { version = "1", features = ["derive"], optional = true }
+humantime = { version = "2", optional = true }
+clap = { version = "4", features = ["derive"], optional = true }
+serde_yaml = { version = "0.9", optional = true }
+toml = { version = "0.8", optional = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = true }
+anyhow = { version = "1", optional = true }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "sync", "net", "io-util"] }
+proptest = "1.6"
+rand = "0.8"
+serde_json = "1"
