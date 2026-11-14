@@ -168,7 +168,11 @@ impl HqfbpCla {
     /// Unregisters a peer and removes it from the BPA routing table.
     pub async fn unregister_peer(&self, callsign: &str) -> Result<()> {
         let cla_addr = callsign_to_cla_address(callsign);
-        self.peer_mappings.write().await.remove(&cla_addr);
+        {
+            let mut mappings = self.peer_mappings.write().await;
+            mappings.remove(&cla_addr);
+            mappings.retain(|_, mapped_callsign| mapped_callsign != callsign);
+        }
         self.peer_encodings.write().await.remove(callsign);
 
         let inner_guard = self.inner.read().await;
@@ -346,5 +350,32 @@ impl Cla for HqfbpCla {
             .map_err(hardy_bpa::cla::Error::from)?;
 
         Ok(outcome)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_unregister_peer_removes_tcp_and_callsign_mappings() {
+        let cla = HqfbpCla::new(Config::default());
+        let tcp_addr: SocketAddr = "127.0.0.1:9001".parse().unwrap();
+
+        cla.register_peer("F4JXQ", Some(tcp_addr), None)
+            .await
+            .unwrap();
+
+        {
+            let mappings = cla.peer_mappings.read().await;
+            assert!(mappings.contains_key(&callsign_to_cla_address("F4JXQ")));
+            assert!(mappings.contains_key(&ClaAddress::Tcp(tcp_addr)));
+        }
+
+        cla.unregister_peer("F4JXQ").await.unwrap();
+
+        let mappings = cla.peer_mappings.read().await;
+        assert!(!mappings.contains_key(&callsign_to_cla_address("F4JXQ")));
+        assert!(!mappings.contains_key(&ClaAddress::Tcp(tcp_addr)));
     }
 }

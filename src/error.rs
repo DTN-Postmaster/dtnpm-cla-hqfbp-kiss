@@ -45,6 +45,10 @@ pub enum Error {
     #[error("invalid encoding: {0}")]
     InvalidEncoding(String),
 
+    /// Missing or invalid station callsign when strict RF identification is required.
+    #[error("invalid or unidentified station callsign: '{0}'")]
+    InvalidCallsign(String),
+
     /// Forwarded bundle exceeds maximum allowed size.
     #[error("bundle payload too large: {size} bytes exceeds maximum {max} bytes")]
     PayloadTooLarge {

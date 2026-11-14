@@ -240,6 +240,10 @@ pub struct Config {
     #[cfg_attr(feature = "serde", serde(default))]
     pub callsign: Option<String>,
 
+    /// Require a valid, identified amateur radio callsign before starting RF transmission.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub require_callsign: bool,
+
     /// Underlying physical or network link transport.
     pub transport: TransportMode,
 
@@ -298,6 +302,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             callsign: None,
+            require_callsign: false,
             transport: TransportMode::Udp {
                 bind_addr: std::net::SocketAddr::from(([127, 0, 0, 1], 10042)),
                 peer_addr: None,
@@ -311,6 +316,43 @@ impl Default for Config {
             session_ttl: default_session_ttl(),
             sweep_interval: default_sweep_interval(),
         }
+    }
+}
+
+/// Returns `true` if `callsign` is missing, blank, or placeholder `N0CALL` (with optional SSID).
+pub fn is_unidentified_callsign(callsign: Option<&str>) -> bool {
+    match callsign {
+        None => true,
+        Some(raw) => {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                return true;
+            }
+            let base = trimmed.split('-').next().unwrap_or(trimmed);
+            base.is_empty() || base.eq_ignore_ascii_case("N0CALL")
+        }
+    }
+}
+
+impl Config {
+    /// Validate local RF callsign configuration according to [`Self::require_callsign`].
+    ///
+    /// When `callsign` is absent or `N0CALL`, emits a warning by default so local tests and
+    /// receive-only listeners work out of the box, or returns [`crate::Error::InvalidCallsign`]
+    /// when `require_callsign` is enabled.
+    pub fn validate_callsign(&self) -> crate::Result<()> {
+        if is_unidentified_callsign(self.callsign.as_deref()) {
+            if self.require_callsign {
+                return Err(crate::Error::InvalidCallsign(
+                    "identified amateur radio callsign is required (got None or N0CALL); set `callsign` or pass `--allow-unidentified-rf`".to_string(),
+                ));
+            }
+            tracing::warn!(
+                callsign = ?self.callsign,
+                "HQFBP CLA running with unidentified RF callsign (None or N0CALL); set `callsign` in config or pass `--require-callsign` before on-air transmission"
+            );
+        }
+        Ok(())
     }
 }
 
@@ -331,6 +373,7 @@ mod tests {
         };
         let cfg = Config {
             callsign: Some("F4JXQ".to_string()),
+            require_callsign: false,
             transport,
             hailing_encodings: default_hailing_encodings(),
             default_bundle_encodings: default_bundle_encodings(),
@@ -497,5 +540,38 @@ mod tests {
         } else {
             panic!("expected KissTcp");
         }
+    }
+
+    #[test]
+    fn test_callsign_identification_policy() {
+        assert!(is_unidentified_callsign(None));
+        assert!(is_unidentified_callsign(Some("")));
+        assert!(is_unidentified_callsign(Some("   ")));
+        assert!(is_unidentified_callsign(Some("N0CALL")));
+        assert!(is_unidentified_callsign(Some("n0call-1")));
+        assert!(!is_unidentified_callsign(Some("F4JXQ")));
+        assert!(!is_unidentified_callsign(Some("F4JXQ-7")));
+
+        let mut cfg = Config::default();
+        assert!(!cfg.require_callsign);
+        assert!(cfg.validate_callsign().is_ok());
+
+        cfg.callsign = Some("N0CALL".to_string());
+        assert!(cfg.validate_callsign().is_ok());
+
+        cfg.require_callsign = true;
+        assert!(matches!(
+            cfg.validate_callsign(),
+            Err(crate::Error::InvalidCallsign(_))
+        ));
+
+        cfg.callsign = None;
+        assert!(matches!(
+            cfg.validate_callsign(),
+            Err(crate::Error::InvalidCallsign(_))
+        ));
+
+        cfg.callsign = Some("F4JXQ".to_string());
+        assert!(cfg.validate_callsign().is_ok());
     }
 }

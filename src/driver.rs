@@ -72,8 +72,31 @@ pub enum DriverCommand {
     Shutdown,
 }
 
+const FESC: u8 = 0xDB;
+const TFEND: u8 = 0xDC;
+const TFESC: u8 = 0xDD;
+
+fn push_kiss_escaped(buf: &mut Vec<u8>, byte: u8) {
+    match byte {
+        FEND => {
+            buf.push(FESC);
+            buf.push(TFEND);
+        }
+        FESC => {
+            buf.push(FESC);
+            buf.push(TFESC);
+        }
+        _ => buf.push(byte),
+    }
+}
+
 fn make_kiss_param_frame(port: u8, cmd: u8, val: u8) -> Vec<u8> {
-    vec![FEND, (port << 4) | (cmd & 0x0F), val, FEND]
+    let mut frame = Vec::with_capacity(6);
+    frame.push(FEND);
+    push_kiss_escaped(&mut frame, (port << 4) | (cmd & 0x0F));
+    push_kiss_escaped(&mut frame, val);
+    frame.push(FEND);
+    frame
 }
 
 /// The background task running the HQFBP CLA engine.
@@ -110,6 +133,14 @@ impl Driver {
         tasks: Arc<TaskPool>,
     ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
+            if let Err(e) = config.validate_callsign() {
+                error!("HQFBP callsign validation failed: {e}");
+                let _ = addr_tx.send(Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    e.to_string(),
+                )));
+                return;
+            }
             let initial_id = config.initial_msg_id;
             let mut rx_manager = RxSessionManager::new(
                 config.max_concurrent_senders,
@@ -154,6 +185,43 @@ impl Driver {
 
             driver.run(addr_tx, tasks).await;
         })
+    }
+
+    fn handle_control_command(&mut self, cmd: DriverCommand) {
+        match cmd {
+            DriverCommand::SetDefaultEncodings { encodings } => {
+                self.rx_manager
+                    .register_peer_encodings("__default__", encodings.clone());
+                self.config.default_bundle_encodings = encodings;
+            }
+            DriverCommand::SetPeerEncodings {
+                callsign,
+                encodings,
+            } => {
+                self.rx_manager.register_peer_encodings(callsign, encodings);
+            }
+            DriverCommand::RegisterPeer {
+                callsign,
+                addr,
+                node_id,
+            } => {
+                if let Some(a) = addr {
+                    self.callsign_to_addr.insert(callsign.clone(), a);
+                    self.addr_to_callsign.insert(a, callsign.clone());
+                }
+                if let Some(node) = node_id {
+                    self.callsign_to_node.insert(callsign, node);
+                }
+            }
+            DriverCommand::UnregisterPeer { callsign } => {
+                if let Some(addr) = self.callsign_to_addr.remove(&callsign) {
+                    self.addr_to_callsign.remove(&addr);
+                }
+                self.callsign_to_node.remove(&callsign);
+                self.rx_manager.unregister_peer_encodings(&callsign);
+            }
+            DriverCommand::Forward { .. } | DriverCommand::Shutdown => {}
+        }
     }
 
     async fn run(
@@ -282,30 +350,7 @@ impl Driver {
                             let outcome = self.transmit_bundle_udp(&socket, target_addr, dst_callsign, encodings, &data).await;
                             let _ = reply_tx.send(outcome);
                         }
-                        DriverCommand::SetDefaultEncodings { encodings } => {
-                            self.rx_manager
-                                .register_peer_encodings("__default__", encodings.clone());
-                            self.config.default_bundle_encodings = encodings;
-                        }
-                        DriverCommand::SetPeerEncodings { callsign, encodings } => {
-                            self.rx_manager.register_peer_encodings(callsign, encodings);
-                        }
-                        DriverCommand::RegisterPeer { callsign, addr, node_id } => {
-                            if let Some(a) = addr {
-                                self.callsign_to_addr.insert(callsign.clone(), a);
-                                self.addr_to_callsign.insert(a, callsign.clone());
-                            }
-                            if let Some(node) = node_id {
-                                self.callsign_to_node.insert(callsign, node);
-                            }
-                        }
-                        DriverCommand::UnregisterPeer { callsign } => {
-                            if let Some(addr) = self.callsign_to_addr.remove(&callsign) {
-                                self.addr_to_callsign.remove(&addr);
-                            }
-                            self.callsign_to_node.remove(&callsign);
-                            self.rx_manager.unregister_peer_encodings(&callsign);
-                        }
+                        other => self.handle_control_command(other),
                     }
                 }
             }
@@ -409,7 +454,6 @@ impl Driver {
             addr_tx,
         } = args;
         let mut backoff = reconnect_initial;
-        let mut reported_addr = false;
         let mut addr_sender = Some(addr_tx);
         let mut sweep_timer = interval(self.config.sweep_interval);
 
@@ -438,7 +482,6 @@ impl Driver {
                     backoff = reconnect_initial;
                     if let Some(tx) = addr_sender.take() {
                         let _ = tx.send(s.local_addr());
-                        reported_addr = true;
                     }
                     s
                 }
@@ -446,11 +489,34 @@ impl Driver {
                     warn!(
                         "Failed to connect to KISS TCP {server_addr}: {e}; retrying in {backoff:?}"
                     );
-                    if !reported_addr && let Some(tx) = addr_sender.take() {
-                        let _ = tx.send(Err(e));
-                        return;
+                    if let Some(tx) = addr_sender.take() {
+                        let placeholder =
+                            bind_addr.unwrap_or_else(|| SocketAddr::from(([127, 0, 0, 1], 0)));
+                        let _ = tx.send(Ok(placeholder));
                     }
-                    tokio::time::sleep(backoff).await;
+                    let sleep = tokio::time::sleep(backoff);
+                    tokio::pin!(sleep);
+                    loop {
+                        tokio::select! {
+                            () = &mut sleep => break,
+                            _ = sweep_timer.tick() => {
+                                self.rx_manager.sweep_expired(self.config.session_ttl);
+                            }
+                            cmd = self.cmd_rx.recv() => {
+                                let Some(cmd) = cmd else { return; };
+                                match cmd {
+                                    DriverCommand::Shutdown => return,
+                                    DriverCommand::Forward { reply_tx, .. } => {
+                                        let _ = reply_tx.send(Err(Error::Io(std::io::Error::new(
+                                            std::io::ErrorKind::NotConnected,
+                                            "KISS TCP connection pending reconnect",
+                                        ))));
+                                    }
+                                    other => self.handle_control_command(other),
+                                }
+                            }
+                        }
+                    }
                     backoff = (backoff * 2).min(reconnect_max);
                     continue 'reconnect;
                 }
@@ -543,28 +609,7 @@ impl Driver {
                                     }
                                 }
                             }
-                            DriverCommand::SetDefaultEncodings { encodings } => {
-                                self.config.default_bundle_encodings = encodings;
-                            }
-                            DriverCommand::SetPeerEncodings { callsign, encodings } => {
-                                self.rx_manager.register_peer_encodings(callsign, encodings);
-                            }
-                            DriverCommand::RegisterPeer { callsign, addr, node_id } => {
-                                if let Some(a) = addr {
-                                    self.callsign_to_addr.insert(callsign.clone(), a);
-                                    self.addr_to_callsign.insert(a, callsign.clone());
-                                }
-                                if let Some(node) = node_id {
-                                    self.callsign_to_node.insert(callsign, node);
-                                }
-                            }
-                            DriverCommand::UnregisterPeer { callsign } => {
-                                if let Some(addr) = self.callsign_to_addr.remove(&callsign) {
-                                    self.addr_to_callsign.remove(&addr);
-                                }
-                                self.callsign_to_node.remove(&callsign);
-                                self.rx_manager.unregister_peer_encodings(&callsign);
-                            }
+                            other => self.handle_control_command(other),
                         }
                     }
                 }
@@ -694,30 +739,7 @@ impl Driver {
                                 }
                             }
                         }
-                        DriverCommand::SetDefaultEncodings { encodings } => {
-                            self.rx_manager
-                                .register_peer_encodings("__default__", encodings.clone());
-                            self.config.default_bundle_encodings = encodings;
-                        }
-                        DriverCommand::SetPeerEncodings { callsign, encodings } => {
-                            self.rx_manager.register_peer_encodings(callsign, encodings);
-                        }
-                        DriverCommand::RegisterPeer { callsign, addr, node_id } => {
-                            if let Some(a) = addr {
-                                self.callsign_to_addr.insert(callsign.clone(), a);
-                                self.addr_to_callsign.insert(a, callsign.clone());
-                            }
-                            if let Some(node) = node_id {
-                                self.callsign_to_node.insert(callsign, node);
-                            }
-                        }
-                        DriverCommand::UnregisterPeer { callsign } => {
-                            if let Some(addr) = self.callsign_to_addr.remove(&callsign) {
-                                self.addr_to_callsign.remove(&addr);
-                            }
-                            self.callsign_to_node.remove(&callsign);
-                            self.rx_manager.unregister_peer_encodings(&callsign);
-                        }
+                        other => self.handle_control_command(other),
                     }
                 }
             }
@@ -740,5 +762,35 @@ impl Driver {
         let _ = addr_tx.send(Err(std::io::Error::other(
             "serial transport requested but 'serial' feature is disabled in this build",
         )));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_make_kiss_param_frame_escapes_special_bytes() {
+        for (port, cmd, val) in [
+            (0, 1, 0x10),
+            (0, 1, FEND),
+            (0, 2, FESC),
+            (12, 0, FEND), // command byte 0xC0 itself equals FEND
+            (13, 11, FESC),
+        ] {
+            let frame = make_kiss_param_frame(port, cmd, val);
+            assert_eq!(frame.first().copied(), Some(FEND));
+            assert_eq!(frame.last().copied(), Some(FEND));
+
+            let mut decoder = KissDecoder::new();
+            let mut decoded = None;
+            for byte in frame {
+                if let Some(out) = decoder.process_byte(byte) {
+                    decoded = Some(out);
+                }
+            }
+            let expected_cmd = (port << 4) | (cmd & 0x0F);
+            assert_eq!(decoded, Some(vec![expected_cmd, val]));
+        }
     }
 }

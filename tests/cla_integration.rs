@@ -121,6 +121,7 @@ async fn test_hqfbp_cla_udp_loopback_and_dynamic_encoding() {
     // Station A
     let cfg_a = Config {
         callsign: Some("F4JXQ".to_string()),
+        require_callsign: false,
         transport: TransportMode::Udp {
             bind_addr: "127.0.0.1:0".parse().unwrap(),
             peer_addr: None,
@@ -145,6 +146,7 @@ async fn test_hqfbp_cla_udp_loopback_and_dynamic_encoding() {
     // Station B
     let cfg_b = Config {
         callsign: Some("ON4KST".to_string()),
+        require_callsign: false,
         transport: TransportMode::Udp {
             bind_addr: "127.0.0.1:0".parse().unwrap(),
             peer_addr: Some(addr_a),
@@ -250,6 +252,7 @@ async fn test_hqfbp_cla_kiss_tcp_leaky_bucket_pacing() {
     // Configure HQFBP CLA with KISS TCP and rate limiting: 2,000 bytes/sec, 500 byte burst capacity
     let cfg = Config {
         callsign: Some("F4JXQ".to_string()),
+        require_callsign: false,
         transport: TransportMode::KissTcp {
             server_addr,
             bind_addr: None,
@@ -337,4 +340,87 @@ async fn test_hqfbp_cla_kiss_tcp_leaky_bucket_pacing() {
         total_read >= 1600,
         "All generated frame bytes should have been received by the KISS peer, got {total_read}"
     );
+}
+
+#[tokio::test]
+async fn test_kiss_tcp_retries_initial_connect_until_server_starts() {
+    // Allocate a free local port then close it so the initial TCP connect fails cleanly.
+    let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let server_addr = probe.local_addr().unwrap();
+    drop(probe);
+
+    let (tx, _rx) = mpsc::channel(16);
+    let sink = Box::new(MockSink { dispatches: tx });
+
+    let cfg = Config {
+        callsign: Some("F4JXQ".to_string()),
+        require_callsign: false,
+        transport: TransportMode::KissTcp {
+            server_addr,
+            bind_addr: None,
+            port: 0,
+            tx_delay: None,
+            persistence: None,
+            slot_time: None,
+            tx_tail: None,
+            reconnect_initial: Duration::from_millis(50),
+            reconnect_max: Duration::from_millis(150),
+            rate_limit_bytes_per_sec: None,
+            burst_capacity_bytes: 2048,
+        },
+        hailing_encodings: vec![ContentEncoding::H, ContentEncoding::Crc32],
+        default_bundle_encodings: vec![ContentEncoding::H, ContentEncoding::Crc32],
+        initial_msg_id: 1,
+        peers: Vec::new(),
+        max_concurrent_senders: 10,
+        max_in_flight_bytes: 1024 * 1024,
+        session_ttl: Duration::from_secs(60),
+        sweep_interval: Duration::from_secs(1),
+    };
+
+    let cla = HqfbpCla::new(cfg);
+    // Must succeed even while KISS TCP server is not yet listening.
+    cla.on_register(sink, &[], None).await;
+    assert!(cla.local_addr().await.is_ok());
+
+    // Wait briefly so at least one failed initial connection + backoff retry elapses.
+    tokio::time::sleep(Duration::from_millis(120)).await;
+
+    // Now start the KISS TCP listener with SO_REUSEADDR on the reserved port.
+    let sock = tokio::net::TcpSocket::new_v4().unwrap();
+    sock.set_reuseaddr(true).unwrap();
+    sock.bind(server_addr).unwrap();
+    let listener = sock.listen(4).unwrap();
+
+    let (mut socket, _) = tokio::time::timeout(Duration::from_secs(3), listener.accept())
+        .await
+        .expect("CLA did not reconnect after delayed server startup")
+        .expect("accept failed");
+
+    // Forward a bundle to confirm the reconnected TCP stream delivers frames.
+    let bundle_data = Bytes::from_static(b"delayed KISS TCP reconnect payload");
+    let mut stream = bundle_data.clone();
+    let dest_addr = callsign_to_cla_address("ON4KST");
+    let bundle_id = Id::default();
+
+    let outcome = cla
+        .forward(
+            None,
+            &dest_addr,
+            &bundle_id,
+            bundle_data.len() as u64,
+            &mut stream,
+        )
+        .await
+        .unwrap();
+    assert!(matches!(outcome, ForwardBundleResult::Sent));
+
+    let mut recv_buf = [0u8; 256];
+    let n = tokio::time::timeout(Duration::from_secs(2), socket.read(&mut recv_buf))
+        .await
+        .expect("timed out waiting for frame")
+        .expect("socket read failed");
+    assert!(n > 0);
+
+    cla.unregister().await;
 }

@@ -12,7 +12,7 @@ pub use address::{
     BROADCAST_CALLSIGN, callsign_to_cla_address, cla_address_to_callsign, is_broadcast_callsign,
 };
 pub use cla::HqfbpCla;
-pub use config::{Config, PeerConfig, TransportMode};
+pub use config::{Config, PeerConfig, TransportMode, is_unidentified_callsign};
 pub use encoding::{
     ContentEncoding, DefaultEncodingSelector, DynamicEncodingSelector, parse_encodings_from_str,
 };

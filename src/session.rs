@@ -32,6 +32,7 @@ struct SenderState {
     buffered_bytes: usize,
     active_message_ids: HashSet<u32>,
     session_bytes: HashMap<u32, usize>,
+    chunk_bytes: HashMap<(u32, u32), usize>,
 }
 
 fn hash_payload(data: &[u8]) -> u64 {
@@ -104,6 +105,12 @@ impl RxSessionManager {
         self.total_buffered_bytes
     }
 
+    /// Returns the per-sender in-flight byte cap (`max_in_flight_bytes / 2`).
+    #[must_use]
+    pub fn per_sender_byte_cap(&self) -> usize {
+        self.max_in_flight_bytes / 2
+    }
+
     /// Returns the configured session inactivity timeout.
     #[must_use]
     pub fn session_ttl(&self) -> Duration {
@@ -169,10 +176,10 @@ impl RxSessionManager {
                 "Evicted oldest sender {:?} ({}) to enforce resource limits",
                 oldest_sender, state.buffered_bytes
             );
-            // Also purge any matching sessions from the underlying deframer
+            // Sweep only expired sessions in the underlying deframer without wiping active senders
+            let _ = self.deframer.cleanup_expired(self.session_ttl);
             for mid in state.active_message_ids {
-                let _ = self.deframer.cleanup_expired(Duration::ZERO);
-                debug!("Purged session for ({:?}, {mid})", oldest_sender);
+                debug!("Evicted session for ({:?}, {mid})", oldest_sender);
             }
             return true;
         }
@@ -193,15 +200,17 @@ impl RxSessionManager {
             });
         }
 
-        // Quick peek at the sender callsign and message ID if possible
-        let (peek_sender, peek_msg_id) = hqfbp_rs::unpack(Bytes::copy_from_slice(pdu))
-            .ok()
-            .map(|(h, _)| {
-                let s = h.src_callsign;
-                let m = h.original_message_id.or(h.message_id);
-                (s, m)
-            })
-            .unwrap_or((None, None));
+        // Quick peek at the sender callsign, message ID, and chunk ID if possible
+        let (peek_sender, peek_msg_id, peek_chunk_id) =
+            hqfbp_rs::unpack(Bytes::copy_from_slice(pdu))
+                .ok()
+                .map(|(h, _)| {
+                    let s = h.src_callsign;
+                    let m = h.original_message_id.or(h.message_id);
+                    let c = h.chunk_id;
+                    (s, m, c)
+                })
+                .unwrap_or((None, None, None));
 
         // Deduplicate chunks belonging to an already completed message
         if let Some(mid) = peek_msg_id
@@ -212,20 +221,89 @@ impl RxSessionManager {
             return Ok(());
         }
 
-        // Ensure we do not exceed sender count limit
+        let per_sender_cap = self.per_sender_byte_cap();
+        let mut swept_expired = false;
+
+        let current_old_chunk_len = |senders: &HashMap<Option<String>, SenderState>| -> usize {
+            match (peek_msg_id, peek_chunk_id) {
+                (Some(mid), Some(cid)) => senders
+                    .get(&peek_sender)
+                    .and_then(|s| s.chunk_bytes.get(&(mid, cid)))
+                    .copied()
+                    .unwrap_or(0),
+                _ => 0,
+            }
+        };
+
+        // Ensure we do not exceed sender count limit; clean up TTL-expired sessions first
         if !self.senders.contains_key(&peek_sender)
             && self.senders.len() >= self.max_concurrent_senders
         {
-            self.evict_oldest_sender(None);
+            self.sweep_expired(self.session_ttl);
+            swept_expired = true;
+            if !self.senders.contains_key(&peek_sender)
+                && self.senders.len() >= self.max_concurrent_senders
+            {
+                self.evict_oldest_sender(None);
+            }
         }
 
-        // Ensure we do not exceed total buffer memory limit
-        while self.total_buffered_bytes + pdu_len > self.max_in_flight_bytes {
-            if !self.evict_oldest_sender(Some(&peek_sender)) {
+        // Enforce per-sender byte cap (max_in_flight_bytes / 2) to prevent single-sender starvation
+        let mut old_chunk_len = current_old_chunk_len(&self.senders);
+        let mut sender_buffered = self
+            .senders
+            .get(&peek_sender)
+            .map_or(0, |s| s.buffered_bytes)
+            .saturating_sub(old_chunk_len);
+        if sender_buffered + pdu_len > per_sender_cap {
+            if !swept_expired {
+                self.sweep_expired(self.session_ttl);
+                swept_expired = true;
+                old_chunk_len = current_old_chunk_len(&self.senders);
+                sender_buffered = self
+                    .senders
+                    .get(&peek_sender)
+                    .map_or(0, |s| s.buffered_bytes)
+                    .saturating_sub(old_chunk_len);
+            }
+            if sender_buffered + pdu_len > per_sender_cap {
                 return Err(Error::MemoryCapExceeded {
-                    current: self.total_buffered_bytes + pdu_len,
-                    max: self.max_in_flight_bytes,
+                    current: sender_buffered + pdu_len,
+                    max: per_sender_cap,
                 });
+            }
+        }
+
+        // Ensure we do not exceed total buffer memory limit; clean up TTL-expired sessions first
+        if self.total_buffered_bytes.saturating_sub(old_chunk_len) + pdu_len
+            > self.max_in_flight_bytes
+        {
+            if !swept_expired {
+                self.sweep_expired(self.session_ttl);
+                old_chunk_len = current_old_chunk_len(&self.senders);
+            }
+            while self.total_buffered_bytes.saturating_sub(old_chunk_len) + pdu_len
+                > self.max_in_flight_bytes
+            {
+                if !self.evict_oldest_sender(Some(&peek_sender)) {
+                    return Err(Error::MemoryCapExceeded {
+                        current: self.total_buffered_bytes.saturating_sub(old_chunk_len) + pdu_len,
+                        max: self.max_in_flight_bytes,
+                    });
+                }
+            }
+        }
+
+        // Deduct replaced/duplicate chunk bytes before accounting the incoming chunk
+        if old_chunk_len > 0 {
+            self.total_buffered_bytes = self.total_buffered_bytes.saturating_sub(old_chunk_len);
+            if let Some(state) = self.senders.get_mut(&peek_sender) {
+                state.buffered_bytes = state.buffered_bytes.saturating_sub(old_chunk_len);
+                if let Some(mid) = peek_msg_id
+                    && let Some(bytes) = state.session_bytes.get_mut(&mid)
+                {
+                    *bytes = bytes.saturating_sub(old_chunk_len);
+                }
             }
         }
 
@@ -241,29 +319,78 @@ impl RxSessionManager {
                 buffered_bytes: 0,
                 active_message_ids: HashSet::new(),
                 session_bytes: HashMap::new(),
+                chunk_bytes: HashMap::new(),
             });
         sender_entry.buffered_bytes += pdu_len;
         sender_entry.last_active = Instant::now();
         if let Some(mid) = peek_msg_id {
             *sender_entry.session_bytes.entry(mid).or_default() += pdu_len;
             sender_entry.active_message_ids.insert(mid);
+            if let Some(cid) = peek_chunk_id {
+                sender_entry.chunk_bytes.insert((mid, cid), pdu_len);
+            }
         }
+
+        let unattributed = if peek_msg_id.is_none() {
+            Some((peek_sender, pdu_len))
+        } else {
+            None
+        };
 
         // Feed to deframer
         self.deframer.receive_bytes(pdu);
-        self.poll_deframer_events();
+        self.poll_deframer_events_with_pending(unattributed);
 
         Ok(())
     }
 
     fn poll_deframer_events(&mut self) {
+        self.poll_deframer_events_with_pending(None);
+    }
+
+    fn poll_deframer_events_with_pending(
+        &mut self,
+        mut pending_unattributed: Option<(Option<String>, usize)>,
+    ) {
         let mut last_mid_by_sender: HashMap<Option<String>, u32> = HashMap::new();
         while let Some(ev) = self.deframer.next_event() {
             match ev {
                 Event::PDU(p) => {
                     let src = p.header.src_callsign;
-                    if let Some(id) = p.header.original_message_id.or(p.header.message_id) {
-                        last_mid_by_sender.insert(src, id);
+                    let mid = p.header.original_message_id.or(p.header.message_id);
+                    if let Some(id) = mid {
+                        last_mid_by_sender.insert(src.clone(), id);
+                    }
+                    if let Some((orig_sender, unattrib_len)) = pending_unattributed.take() {
+                        // Re-attribute outer-encoded PDU bytes once header is decoded
+                        if orig_sender != src {
+                            if let Some(orig_state) = self.senders.get_mut(&orig_sender) {
+                                orig_state.buffered_bytes =
+                                    orig_state.buffered_bytes.saturating_sub(unattrib_len);
+                            }
+                            self.touch_sender(&src);
+                            let dest_state =
+                                self.senders
+                                    .entry(src.clone())
+                                    .or_insert_with(|| SenderState {
+                                        last_active: Instant::now(),
+                                        buffered_bytes: 0,
+                                        active_message_ids: HashSet::new(),
+                                        session_bytes: HashMap::new(),
+                                        chunk_bytes: HashMap::new(),
+                                    });
+                            dest_state.buffered_bytes += unattrib_len;
+                            dest_state.last_active = Instant::now();
+                        }
+                        if let Some(id) = mid
+                            && let Some(state) = self.senders.get_mut(&src)
+                        {
+                            *state.session_bytes.entry(id).or_default() += unattrib_len;
+                            state.active_message_ids.insert(id);
+                            if let Some(cid) = p.header.chunk_id {
+                                state.chunk_bytes.insert((id, cid), unattrib_len);
+                            }
+                        }
                     }
                 }
                 Event::Message(me) => {
@@ -277,17 +404,10 @@ impl RxSessionManager {
 
                     let p_hash = hash_payload(&me.payload);
                     let dup_key = (src.clone(), p_hash);
-                    if self.completed_payloads.contains_key(&dup_key) {
-                        debug!(
-                            "Ignoring duplicate payload hash {:?} from {:?}",
-                            p_hash, src
-                        );
-                        continue;
-                    }
+                    let is_dup_payload = self.completed_payloads.contains_key(&dup_key);
                     let completion_time = Instant::now();
-                    self.completed_payloads.insert(dup_key, completion_time);
 
-                    // Release memory allocated for this sender
+                    // Always release memory allocated for this sender, even on duplicate payload
                     if let Some(state) = self.senders.get_mut(&src) {
                         let finished_ids: Vec<u32> = if let Some(id) = mid {
                             state.active_message_ids.remove(&id);
@@ -302,16 +422,27 @@ impl RxSessionManager {
                                 deducted += bytes;
                                 found_session = true;
                             }
+                            state.chunk_bytes.retain(|(msg_id, _), _| msg_id != id);
                             self.completed_sessions
                                 .insert((src.clone(), *id), completion_time);
                         }
                         if !found_session {
                             deducted = state.buffered_bytes;
+                            state.chunk_bytes.clear();
                         }
                         state.buffered_bytes = state.buffered_bytes.saturating_sub(deducted);
                         self.total_buffered_bytes =
                             self.total_buffered_bytes.saturating_sub(deducted);
                     }
+
+                    if is_dup_payload {
+                        debug!(
+                            "Ignoring duplicate payload hash {:?} from {:?}",
+                            p_hash, src
+                        );
+                        continue;
+                    }
+                    self.completed_payloads.insert(dup_key, completion_time);
 
                     self.completed_messages.push_back(CompletedMessage {
                         src_callsign: src,
@@ -468,27 +599,39 @@ mod tests {
 
     #[test]
     fn test_memory_cap_boundaries_and_accounting() {
-        let mut mgr = RxSessionManager::new(10, 100, Duration::from_secs(60));
+        // Max total bytes = 200 -> per-sender byte cap = 100
+        let mut mgr = RxSessionManager::new(10, 200, Duration::from_secs(60));
+        assert_eq!(mgr.per_sender_byte_cap(), 100);
 
-        // Exact boundary: PDU length == max_in_flight_bytes is allowed (pdu_len > max is false)
+        // Exact per-sender boundary: PDU length == max_in_flight_bytes / 2 is allowed
         let exact_pdu = vec![0x42; 100];
-        let res = mgr.process_pdu(&exact_pdu);
-        assert!(res.is_ok());
+        mgr.process_pdu(&exact_pdu).unwrap();
         assert_eq!(mgr.buffered_bytes(), 100);
 
-        // Reset
-        let mut mgr2 = RxSessionManager::new(10, 100, Duration::from_secs(60));
-        let pdu_101 = vec![0x42; 101];
-        let err = mgr2.process_pdu(&pdu_101).unwrap_err();
+        // Exceeding global ceiling returns PayloadTooLarge
+        let mut mgr2 = RxSessionManager::new(10, 200, Duration::from_secs(60));
+        let pdu_201 = vec![0x42; 201];
+        let err = mgr2.process_pdu(&pdu_201).unwrap_err();
         match err {
             Error::PayloadTooLarge { size, max } => {
-                assert_eq!(size, 101);
-                assert_eq!(max, 100);
+                assert_eq!(size, 201);
+                assert_eq!(max, 200);
             }
             other => panic!("expected PayloadTooLarge, got {other:?}"),
         }
 
-        // Test multi-sender eviction under memory cap
+        // Single sender cannot allocate more than per-sender cap (100 out of 200)
+        let pdu_101 = vec![0x42; 101];
+        let err_sender = mgr2.process_pdu(&pdu_101).unwrap_err();
+        match err_sender {
+            Error::MemoryCapExceeded { current, max } => {
+                assert_eq!(current, 101);
+                assert_eq!(max, 100);
+            }
+            other => panic!("expected MemoryCapExceeded, got {other:?}"),
+        }
+
+        // Test multi-sender eviction under global memory cap while obeying 50% per-sender cap
         let mut mgr3 = RxSessionManager::new(10, 120, Duration::from_secs(60));
         let mut gen1 = PDUGenerator::new(
             Some("S1".to_string()),
@@ -512,6 +655,17 @@ mod tests {
             None,
             2,
         );
+        let mut gen3 = PDUGenerator::new(
+            Some("S3".to_string()),
+            None,
+            Some(vec![
+                ContentEncoding::Chunk(16),
+                ContentEncoding::H,
+                ContentEncoding::Crc32,
+            ]),
+            None,
+            3,
+        );
 
         let pdus1 = gen1
             .generate(
@@ -525,25 +679,37 @@ mod tests {
                 None,
             )
             .unwrap();
+        let pdus3 = gen3
+            .generate(
+                b"Message from S3 with several chunks to avoid immediate completion",
+                None,
+            )
+            .unwrap();
 
         mgr3.process_pdu(&pdus1[0]).unwrap();
         let s1_bytes = mgr3.buffered_bytes();
-        assert!(s1_bytes > 0 && s1_bytes < 120);
+        assert!(s1_bytes > 0 && s1_bytes <= 60);
 
         mgr3.process_pdu(&pdus2[0]).unwrap();
-        let total_bytes = mgr3.buffered_bytes();
-        let s2_bytes = total_bytes - s1_bytes;
-        assert_eq!(mgr3.sender_count(), 2);
+        let s2_bytes = mgr3.buffered_bytes() - s1_bytes;
 
-        // Ingest a chunk that forces eviction of S1
-        let fill_size = 120 - s2_bytes;
-        let large_chunk = vec![0x33; fill_size];
+        // Third sender within per-sender cap (<= 60) pushes total past 120 when combined with a raw chunk
+        mgr3.process_pdu(&pdus3[0]).unwrap();
+        let s3_bytes = mgr3.buffered_bytes() - s1_bytes - s2_bytes;
+
+        let remaining_for_raw = (120 - s2_bytes - s3_bytes).min(60);
+        assert!(s2_bytes + s3_bytes + remaining_for_raw > 120 - s1_bytes);
+        let large_chunk = vec![0x33; remaining_for_raw];
         mgr3.process_pdu(&large_chunk).unwrap();
 
-        // S1 must be evicted, and total buffered bytes must be s2_bytes + fill_size (120)
-        assert_eq!(mgr3.buffered_bytes(), 120);
+        // S1 must be evicted to keep total within 120
+        assert!(mgr3.buffered_bytes() <= 120);
+        assert_eq!(
+            mgr3.buffered_bytes(),
+            s2_bytes + s3_bytes + remaining_for_raw
+        );
 
-        // When a single sender exceeds remaining capacity and cannot evict anyone
+        // When a single sender exceeds its per-sender cap (50% of max_in_flight_bytes)
         let mut gen_solo = PDUGenerator::new(
             Some("SOLO".to_string()),
             None,
@@ -560,7 +726,9 @@ mod tests {
         let chunk0_len = pdus_solo[0].len();
         let chunk1_len = pdus_solo[1].len();
 
-        let mut mgr_tight = RxSessionManager::new(10, chunk0_len + 5, Duration::from_secs(60));
+        let per_sender_tight = chunk0_len + 5;
+        let mut mgr_tight =
+            RxSessionManager::new(10, per_sender_tight * 2, Duration::from_secs(60));
         mgr_tight.process_pdu(&pdus_solo[0]).unwrap();
         assert_eq!(mgr_tight.buffered_bytes(), chunk0_len);
         assert_eq!(mgr_tight.sender_count(), 1);
@@ -568,7 +736,7 @@ mod tests {
         let err = mgr_tight.process_pdu(&pdus_solo[1]).unwrap_err();
         match err {
             Error::MemoryCapExceeded { current, max } => {
-                assert_eq!(max, chunk0_len + 5);
+                assert_eq!(max, per_sender_tight);
                 assert_eq!(current, chunk0_len + chunk1_len);
             }
             other => panic!("expected MemoryCapExceeded, got {other:?}"),
@@ -915,5 +1083,285 @@ mod tests {
             b"Message B from F4JXQ that is chunked into pieces"
         );
         assert_eq!(mgr.buffered_bytes(), 0);
+    }
+
+    #[test]
+    fn test_evict_oldest_sender_preserves_other_active_deframer_sessions() {
+        // HQFBP-01: Evicting STA1 must not wipe active STA2 chunks from the underlying Deframer.
+        let mut mgr = RxSessionManager::new(2, 1024 * 1024, Duration::from_secs(60));
+        let mut gen1 = PDUGenerator::new(
+            Some("STA1".to_string()),
+            None,
+            Some(vec![
+                ContentEncoding::Chunk(16),
+                ContentEncoding::H,
+                ContentEncoding::Crc32,
+            ]),
+            None,
+            1,
+        );
+        let mut gen2 = PDUGenerator::new(
+            Some("STA2".to_string()),
+            None,
+            Some(vec![
+                ContentEncoding::Chunk(16),
+                ContentEncoding::H,
+                ContentEncoding::Crc32,
+            ]),
+            None,
+            2,
+        );
+        let mut gen3 = PDUGenerator::new(
+            Some("STA3".to_string()),
+            None,
+            Some(vec![
+                ContentEncoding::Chunk(16),
+                ContentEncoding::H,
+                ContentEncoding::Crc32,
+            ]),
+            None,
+            3,
+        );
+
+        let pdus1 = gen1
+            .generate(b"Incomplete session from STA1 that gets evicted", None)
+            .unwrap();
+        let pdus2 = gen2
+            .generate(b"Concurrent active session from STA2 survives!", None)
+            .unwrap();
+        let pdus3 = gen3
+            .generate(b"New session from STA3 triggers sender eviction", None)
+            .unwrap();
+
+        mgr.process_pdu(&pdus1[0]).unwrap();
+        mgr.process_pdu(&pdus2[0]).unwrap();
+        // Triggers eviction of STA1 (oldest)
+        mgr.process_pdu(&pdus3[0]).unwrap();
+        assert_eq!(
+            mgr.lru_list(),
+            vec![Some("STA2".to_string()), Some("STA3".to_string())]
+        );
+
+        // STA2 completes cleanly because Deframer was NOT wiped with Duration::ZERO
+        for pdu in &pdus2[1..] {
+            mgr.process_pdu(pdu).unwrap();
+        }
+        let completed = mgr.drain_completed_messages();
+        assert_eq!(completed.len(), 1);
+        assert_eq!(
+            completed[0].payload.as_ref(),
+            b"Concurrent active session from STA2 survives!"
+        );
+    }
+
+    #[test]
+    fn test_ttl_cleanup_runs_before_evicting_active_senders() {
+        // HQFBP-01: Expired senders are purged by TTL before evicting still-active senders.
+        let mut mgr = RxSessionManager::new(2, 1024 * 1024, Duration::from_millis(40));
+        let mut gen1 = PDUGenerator::new(
+            Some("OLD1".to_string()),
+            None,
+            Some(vec![
+                ContentEncoding::Chunk(16),
+                ContentEncoding::H,
+                ContentEncoding::Crc32,
+            ]),
+            None,
+            1,
+        );
+        let mut gen2 = PDUGenerator::new(
+            Some("ACT2".to_string()),
+            None,
+            Some(vec![
+                ContentEncoding::Chunk(16),
+                ContentEncoding::H,
+                ContentEncoding::Crc32,
+            ]),
+            None,
+            2,
+        );
+        let mut gen3 = PDUGenerator::new(
+            Some("NEW3".to_string()),
+            None,
+            Some(vec![
+                ContentEncoding::Chunk(16),
+                ContentEncoding::H,
+                ContentEncoding::Crc32,
+            ]),
+            None,
+            3,
+        );
+
+        let pdus1 = gen1
+            .generate(b"Expired session from OLD1 before timeout", None)
+            .unwrap();
+        let pdus2 = gen2
+            .generate(b"Active session from ACT2 refreshed mid-window", None)
+            .unwrap();
+        let pdus3 = gen3
+            .generate(b"Fresh session from NEW3 arrives when full", None)
+            .unwrap();
+
+        mgr.process_pdu(&pdus1[0]).unwrap();
+        std::thread::sleep(Duration::from_millis(25));
+        mgr.process_pdu(&pdus2[0]).unwrap();
+        std::thread::sleep(Duration::from_millis(25));
+        // Now OLD1 is ~50ms old (>= 40ms TTL), ACT2 is ~25ms old (< 40ms TTL)
+        mgr.process_pdu(&pdus3[0]).unwrap();
+
+        assert_eq!(
+            mgr.lru_list(),
+            vec![Some("ACT2".to_string()), Some("NEW3".to_string())]
+        );
+
+        for pdu in &pdus2[1..] {
+            mgr.process_pdu(pdu).unwrap();
+        }
+        for pdu in &pdus3[1..] {
+            mgr.process_pdu(pdu).unwrap();
+        }
+        let completed = mgr.drain_completed_messages();
+        assert_eq!(completed.len(), 2);
+        assert_eq!(mgr.buffered_bytes(), 0);
+    }
+
+    #[test]
+    fn test_duplicate_chunk_does_not_inflate_buffered_bytes() {
+        // HQFBP-02: Re-transmitted chunks must deduct old bytes so buffered_bytes stays exact.
+        let mut mgr = RxSessionManager::new(10, 1024, Duration::from_secs(60));
+        let mut pdu_gen = PDUGenerator::new(
+            Some("F4JXQ".to_string()),
+            None,
+            Some(vec![
+                ContentEncoding::Chunk(16),
+                ContentEncoding::H,
+                ContentEncoding::Crc32,
+            ]),
+            None,
+            10,
+        );
+        let pdus = pdu_gen
+            .generate(b"Multi-chunk payload with repeated chunk delivery", None)
+            .unwrap();
+        assert!(pdus.len() >= 2);
+
+        mgr.process_pdu(&pdus[0]).unwrap();
+        let initial_bytes = mgr.buffered_bytes();
+        assert_eq!(initial_bytes, pdus[0].len());
+
+        // Resend chunk 0 twenty times: exceeds total memory if leaked, must remain constant!
+        for _ in 0..20 {
+            mgr.process_pdu(&pdus[0]).unwrap();
+            assert_eq!(mgr.buffered_bytes(), initial_bytes);
+        }
+
+        for pdu in &pdus[1..] {
+            mgr.process_pdu(pdu).unwrap();
+        }
+        assert_eq!(mgr.drain_completed_messages().len(), 1);
+        assert_eq!(mgr.buffered_bytes(), 0);
+    }
+
+    #[test]
+    fn test_duplicate_payload_still_frees_buffered_bytes() {
+        // HQFBP-02: Identical payload under a new message_id must still free buffer accounting.
+        let mut mgr = RxSessionManager::new(10, 4096, Duration::from_secs(60));
+        let payload = b"Repeated payload across distinct HQFBP message IDs";
+
+        let mut gen1 = PDUGenerator::new(
+            Some("F4JXQ".to_string()),
+            None,
+            Some(vec![
+                ContentEncoding::Chunk(16),
+                ContentEncoding::H,
+                ContentEncoding::Crc32,
+            ]),
+            None,
+            1,
+        );
+        let mut gen2 = PDUGenerator::new(
+            Some("F4JXQ".to_string()),
+            None,
+            Some(vec![
+                ContentEncoding::Chunk(16),
+                ContentEncoding::H,
+                ContentEncoding::Crc32,
+            ]),
+            None,
+            2,
+        );
+
+        for pdu in gen1.generate(payload, None).unwrap() {
+            mgr.process_pdu(&pdu).unwrap();
+        }
+        assert_eq!(mgr.drain_completed_messages().len(), 1);
+        assert_eq!(mgr.buffered_bytes(), 0);
+
+        for pdu in gen2.generate(payload, None).unwrap() {
+            mgr.process_pdu(&pdu).unwrap();
+        }
+        assert_eq!(mgr.drain_completed_messages().len(), 0);
+        assert_eq!(mgr.buffered_bytes(), 0);
+    }
+
+    #[test]
+    fn test_per_sender_cap_prevents_single_sender_starvation() {
+        // HQFBP-02: No single sender can consume > max_in_flight_bytes / 2.
+        let mut mgr = RxSessionManager::new(10, 200, Duration::from_secs(60));
+        let mut evil_gen = PDUGenerator::new(
+            Some("EVIL".to_string()),
+            None,
+            Some(vec![
+                ContentEncoding::Chunk(16),
+                ContentEncoding::H,
+                ContentEncoding::Crc32,
+            ]),
+            None,
+            1,
+        );
+        let mut good_gen = PDUGenerator::new(
+            Some("GOOD".to_string()),
+            None,
+            Some(vec![
+                ContentEncoding::Chunk(64),
+                ContentEncoding::H,
+                ContentEncoding::Crc32,
+            ]),
+            None,
+            2,
+        );
+
+        let evil_pdus = evil_gen
+            .generate(
+                b"Very long incomplete message from attacker intended to exhaust buffer space!",
+                None,
+            )
+            .unwrap();
+        let good_pdus = good_gen.generate(b"Short honest bundle", None).unwrap();
+
+        let mut evil_accepted = 0usize;
+        let mut rejected = false;
+        for pdu in &evil_pdus[..evil_pdus.len() - 1] {
+            match mgr.process_pdu(pdu) {
+                Ok(()) => evil_accepted += pdu.len(),
+                Err(Error::MemoryCapExceeded { current, max }) => {
+                    assert_eq!(max, 100);
+                    assert!(current > 100);
+                    rejected = true;
+                    break;
+                }
+                Err(other) => panic!("unexpected error: {other:?}"),
+            }
+        }
+        assert!(rejected);
+        assert!(evil_accepted <= 100);
+
+        // Honest sender can still complete using the remaining 50% capacity!
+        for pdu in &good_pdus {
+            mgr.process_pdu(pdu).unwrap();
+        }
+        let completed = mgr.drain_completed_messages();
+        assert_eq!(completed.len(), 1);
+        assert_eq!(completed[0].payload.as_ref(), b"Short honest bundle");
     }
 }
