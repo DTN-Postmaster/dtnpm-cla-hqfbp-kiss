@@ -38,6 +38,14 @@ Requires sibling checkouts of `../dtnpm-core`, `../../hardy/*`, and `../../hqfbp
 cargo test --workspace --exclude dtnpm-cla-hqfbp-kiss-fuzz
 ```
 
+## Security & Compliance
+
+- **Cyber Resilience Act (CRA)**: Strict callsign syntax validation, secure token handling via `--token-file`, VEX audit documentation (`RUSTSEC-2026-0459`), and SHA-pinned CI actions.
+- **Explicit Permissive Mode (Opt-in)**: Unidentified RF operations (blank callsign or `N0CALL`) emit warnings by default and are permitted for lab SDR/receive tests via `--allow-unidentified-rf` / `require_callsign: false`.
+- **Resource Bounds & Protocol Safety**: Cross-station DoS protection in deframing session management (`evict_oldest_sender` TTL isolation), duplicate-aware chunk accounting preventing memory leaks, escaped KISS control frames, and auto-reconnecting TCP KISS driver with exponential backoff.
+- **Rust Quality Standards**: 100% `unwrap`-free and `panic!`-free production codebase.
+- **Documentation**: See [`AGENTS.md`](AGENTS.md), [`CONTRIBUTING.md`](CONTRIBUTING.md), [`SECURITY.md`](SECURITY.md), and Architectural Decision Records in [`adr/`](adr/).
+
 ## License
 
 Dual-licensed under the Apache License, Version 2.0 or the MIT License. See [LICENSE.md](LICENSE.md).
