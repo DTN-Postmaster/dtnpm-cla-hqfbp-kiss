@@ -54,6 +54,9 @@ use tokio::io::AsyncReadExt;
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 
+use dtnpm_cla_hqfbp_kiss::{
+    Config, ContentEncoding, HqfbpCla, TransportMode, callsign_to_cla_address,
+};
 use hardy_bpa::async_trait;
 use hardy_bpa::cla::{
     Acceptance, Cla, ClaAddress, ForwardBundleResult, Result as ClaResult, Segment, Sink,
@@ -62,7 +65,6 @@ use hardy_bpa::cla::{
 use hardy_bpa::stream::Receiver;
 use hardy_bpv7::bundle::Id;
 use hardy_bpv7::eid::NodeId;
-use dtnpm_cla_hqfbp_kiss::{Config, ContentEncoding, HqfbpCla, TransportMode, callsign_to_cla_address};
 
 struct MockSink {
     dispatches: mpsc::Sender<(Option<NodeId>, Option<ClaAddress>, Bytes)>,
