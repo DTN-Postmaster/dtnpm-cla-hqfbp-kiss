@@ -1,21 +1,21 @@
-# Guide de Contribution — `dtnpm-cla-hqfbp-kiss`
+# Contributing Guide — `dtnpm-cla-hqfbp-kiss`
 
-Ce guide présente les règles de développement et les exigences de sécurité pour le CLA HQFBP et KISS de `dtnpm-cla-hqfbp-kiss`.
-
----
-
-## 1. Principes Fondamentaux
-
-- **Zéro Panic / Zéro Unwrap** : Aucun appel `.unwrap()` ou `.expect()` en code de production.
-- **Sécurité et Bornage des Sessions RF** :
-  - La gestion de sessions multi-émetteurs doit isoler les stations pour qu'une perturbation sur une liaison n'affecte pas les autres.
-  - La mémoire de déframage doit être strictement bornée et libérée lors du remplacement de paquets dupliqués.
-- **Traçabilité Architecturale (ADR)** :
-  - Tout ajout ou ajustement protocolaire doit faire l'objet d'un fichier ADR sous `adr/` et être indexé dans `adr/README.md`.
+This guide outlines the development rules and security requirements for the HQFBP and KISS CLA in `dtnpm-cla-hqfbp-kiss`.
 
 ---
 
-## 2. Vérification Locale
+## 1. Core Principles
+
+- **Zero Panic / Zero Unwrap**: No `.unwrap()` or `.expect()` calls in production code.
+- **RF Session Security and Bounds**:
+  - Multi-sender session management must isolate stations so that interference on one link does not affect others.
+  - Defragmentation memory must be strictly bounded and released when replacing duplicate packets.
+- **Architectural Traceability (ADR)**:
+  - Any protocol addition or adjustment must be documented in an ADR file under `adr/` and indexed in `adr/README.md`.
+
+---
+
+## 2. Local Verification
 
 ```bash
 cargo fmt --all -- --check

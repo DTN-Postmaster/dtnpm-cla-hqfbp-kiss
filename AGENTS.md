@@ -1,49 +1,51 @@
 # Agent Guide — `dtnpm-cla-hqfbp-kiss`
 
 ## 🎯 Mission
-Fournir l'adaptateur de couche de convergence (CLA) pour le protocole de diffusion radioamateur rapide HQFBP (Hamradio Quick File Broadcasting Protocol) sur canaux radioamateurs (KISS TCP pour Direwolf/Soundmodem, KISS Série/TTY, et UDP pour SDR), avec support de la correction d'erreur directe (FEC Reed-Solomon et RaptorQ).
+Provide the Convergence Layer Adapter (CLA) for the Hamradio Quick File Broadcasting Protocol (HQFBP) over amateur radio channels (KISS TCP for Direwolf/Soundmodem, KISS Serial/TTY, and UDP for SDR), with Forward Error Correction support (Reed-Solomon and RaptorQ FEC).
 
 ---
 
-## 🛡️ Référentiels et Exigences de Sécurité
+## 🛡️ Security Frameworks and Requirements
 
-### 1. Cyber Resilience Act (CRA) & Sécurité Radioamateur
-- **Validation d'Identité Radioamateur** :
-  - Les indicatifs d'appel sont normalisés et validés avec rigueur syntaxique (`is_valid_callsign` : 3 à 10 caractères alphanumériques ASCII, au moins une lettre, SSID optionnel `-0` à `-15`, rejet strict de `\r`, `\n`, `\0`).
-- **Opt-in Explicite pour les Tests en Laboratoire** :
-  - L'exploitation avec un indicatif non identifié (blanc ou `N0CALL`) émet un avertissement par défaut et n'est autorisée en transmission que sur demande explicite via `--allow-unidentified-rf` ou `require_callsign: false`.
-  - Le drapeau `--require-callsign` permet d'imposer un indicatif strictement valide avant toute transmission RF.
-- **Supply-Chain & VEX** :
-  - Dépendances auditées avec `cargo-audit` et `cargo-deny` ; déclaration VEX `not_affected` pour `RUSTSEC-2026-0459`.
-  - Utilisation de `yaml_serde` (sans libyaml).
-  - Actions GitHub CI épinglées par SHA-1 à 40 caractères.
-- **Politique de sécurité** : Consignée dans [SECURITY.md](SECURITY.md).
+### 1. Cyber Resilience Act (CRA) & Amateur Radio Security
+- **Amateur Radio Identity Validation**:
+  - Callsigns are normalized and strictly validated syntactically (`is_valid_callsign`: 3 to 10 ASCII alphanumeric characters, at least one letter, optional SSID `-0` to `-15`, strict rejection of `\r`, `\n`, `\0`).
+- **Explicit Opt-In for Lab Testing**:
+  - Operating with an unidentified callsign (blank or `N0CALL`) emits a warning by default and is only permitted for transmission upon explicit request via `--allow-unidentified-rf` or `require_callsign: false`.
+  - The `--require-callsign` flag enforces a strictly valid callsign before any RF transmission.
+- **Supply-Chain & VEX**:
+  - Dependencies audited with `cargo-audit` and `cargo-deny`; VEX `not_affected` statement for `RUSTSEC-2026-0459`.
+  - Uses `yaml_serde` (without libyaml).
+  - GitHub CI actions pinned by full 40-character SHA-1.
+- **Security Policy**: Documented in [SECURITY.md](SECURITY.md).
 
-### 2. Robustesse Protocolaire & Isolation des Sessions
-- **Protection DoS Inter-Stations (`RxSessionManager`)** :
-  - L'éviction d'un émetteur ancien (`evict_oldest_sender`) passe le TTL configuré (`self.session_ttl`) et ne doit JAMAIS réinitialiser à zéro les sessions actives des autres stations radio.
-  - Nettoyage préventif des sessions expirées (`sweep_expired`) avant tout délestage de capacité ou LRU.
-- **Comptabilité Mémoire Résiliente au Bruit Radio** :
-  - Comptabilisation par chunk (`chunk_bytes: HashMap<(u32, u32), usize>`) sur `SenderState` avec déduction des doublons pour éviter toute fuite de quota mémoire lors de trames dupliquées ou bruitées.
-  - Plafond par émetteur imposé (`per_sender_byte_cap = max_in_flight_bytes / 2`).
-- **Échappement Protocolaire KISS** :
-  - Échappement systématique des octets de contrôle `FEND` (`0xC0`) et `FESC` (`0xDB`) dans `make_kiss_param_frame`.
-- **Résilience Réseau** :
-  - Reconnexion automatique avec backoff exponentiel (`reconnect_initial` à `reconnect_max`) en cas d'échec de liaison TCP avec le TNC.
-
----
-
-## 🦀 Standards d'Ingénierie Rust
-
-1. **Règle Zéro Panic / Zéro Unwrap** :
-   - Tout le code sous `src/` doit être 100% exempt de `.unwrap()`, `.expect()` et de macro `panic!`.
-   - Linter strict : `-D warnings -D clippy::unwrap_used -D clippy::panic`.
-2. **ADRs Obligatoires** :
-   - Toute décision architecturale HQFBP/KISS doit être consignée sous `adr/` et indexée dans [adr/README.md](adr/README.md).
+### 2. Protocol Robustness & Session Isolation
+- **Cross-Station DoS Protection (`RxSessionManager`)**:
+  - Evicting an old sender (`evict_oldest_sender`) checks the configured TTL (`self.session_ttl`) and must NEVER reset active sessions of other radio stations to zero.
+  - Preventive cleanup of expired sessions (`sweep_expired`) before any capacity shedding or LRU eviction.
+- **RF-Noise-Resilient Memory Accounting**:
+  - Per-chunk accounting (`chunk_bytes: HashMap<(u32, u32), usize>`) on `SenderState` with deduplication deduction to prevent memory quota leaks during duplicated or noisy frames.
+  - Enforced per-sender cap (`per_sender_byte_cap = max_in_flight_bytes / 2`).
+- **KISS Protocol Escaping**:
+  - Systematic escaping of control bytes `FEND` (`0xC0`) and `FESC` (`0xDB`) in `make_kiss_param_frame`.
+- **Network Resilience**:
+  - Automatic reconnection with exponential backoff (`reconnect_initial` to `reconnect_max`) upon TCP link failure with the TNC.
 
 ---
 
-## ⚡ Commandes Critiques de Vérification
+## 🦀 Rust Engineering Standards
+
+1. **Zero Panic / Zero Unwrap Rule**:
+   - All code under `src/` must be 100% free of `.unwrap()`, `.expect()`, and the `panic!` macro.
+   - Strict linter: `-D warnings -D clippy::unwrap_used -D clippy::panic`.
+2. **Mandatory ADRs**:
+   - Any HQFBP/KISS architectural decision must be recorded under `adr/` and indexed in [adr/README.md](adr/README.md).
+3. **Documentation Language**:
+   - English must be used as the language for all documentation, unless the file is suffixed with `.fr.md` or another language is explicitly requested in the prompt.
+
+---
+
+## ⚡ Critical Verification Commands
 
 - `cargo fmt --all -- --check`
 - `cargo clippy --offline --workspace --lib --bins -- -D warnings -D clippy::unwrap_used -D clippy::panic`
