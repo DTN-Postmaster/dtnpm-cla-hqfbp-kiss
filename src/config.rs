@@ -102,13 +102,19 @@ pub enum TransportMode {
         /// Initial reconnect delay on connection loss (default 500ms).
         #[cfg_attr(
             feature = "serde",
-            serde(default = "default_reconnect_initial", with = "humantime_duration")
+            serde(
+                default = "default_reconnect_initial",
+                with = "dtnpm_core::duration::serde_duration"
+            )
         )]
         reconnect_initial: Duration,
         /// Maximum reconnect backoff delay (default 30s).
         #[cfg_attr(
             feature = "serde",
-            serde(default = "default_reconnect_max", with = "humantime_duration")
+            serde(
+                default = "default_reconnect_max",
+                with = "dtnpm_core::duration::serde_duration"
+            )
         )]
         reconnect_max: Duration,
         /// Optional rate limit in bytes per second for the aggregate KISS stream (e.g. 1200 or 9600).
@@ -188,28 +194,6 @@ impl TransportMode {
     }
 }
 
-#[cfg(feature = "serde")]
-mod humantime_duration {
-    use std::time::Duration;
-
-    use serde::{Deserialize, Deserializer, Serializer};
-
-    pub fn serialize<S>(duration: &Duration, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        serializer.serialize_str(&humantime::format_duration(*duration).to_string())
-    }
-
-    pub fn deserialize<'de, D>(deserializer: D) -> Result<Duration, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let s = String::deserialize(deserializer)?;
-        humantime::parse_duration(&s).map_err(serde::de::Error::custom)
-    }
-}
-
 /// A configured remote peer mapping.
 #[derive(Debug, Clone, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -286,14 +270,20 @@ pub struct Config {
     /// Inactivity timeout before purging an uncompleted reassembly session.
     #[cfg_attr(
         feature = "serde",
-        serde(default = "default_session_ttl", with = "humantime_duration")
+        serde(
+            default = "default_session_ttl",
+            with = "dtnpm_core::duration::serde_duration"
+        )
     )]
     pub session_ttl: Duration,
 
     /// Interval at which expired sessions and inactive senders are swept.
     #[cfg_attr(
         feature = "serde",
-        serde(default = "default_sweep_interval", with = "humantime_duration")
+        serde(
+            default = "default_sweep_interval",
+            with = "dtnpm_core::duration::serde_duration"
+        )
     )]
     pub sweep_interval: Duration,
 }
